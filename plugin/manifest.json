@@ -1,7 +1,7 @@
 {
   "domain": "bilibili",
   "name": "哔哩哔哩",
-  "version": "0.3.0",
+  "version": "0.3.0-beta-1",
   "description": "适用于 Content Hive 的哔哩哔哩内容解析插件，通过解析视频页面和播放地址接口获取内容。",
   "author": [
     "content-hive"
