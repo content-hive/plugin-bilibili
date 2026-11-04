@@ -29,9 +29,11 @@ SPACE_APP_URL = "https://app.bilibili.com/x/v2/space"
 APPKEY = "1d8b6e7d45233436"
 APPSEC = "560c52ccd288fed045859ed18bffd973"
 
-# Muxed MP4 (durl). DASH is not used because Content Hive has no ffmpeg muxer.
-PLAYURL_FNVAL = 1
-PLAYURL_QN = 80
+# DASH (video+audio) plus HDR / 4K / Dolby / 8K / AV1. Muxed mp4 is a fallback.
+PLAYURL_FNVAL = 4048
+PLAYURL_QN = 127
+
+DOWNLOAD_TIMEOUT = 600
 
 # Nominal short-edge pixels for playurl quality IDs (used to size the downloaded mp4).
 QUALITY_PIXELS = {

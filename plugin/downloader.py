@@ -32,10 +32,7 @@ async def _invoke_progress(on_progress: ProgressCallback | None, pct: int) -> No
 
 
 def _bind_media_progress(on_progress: ProgressCallback | None):
-    """Convert media byte progress to on_progress percent (0-99, monotonic).
-
-    100 is reserved for the final callback after download_file succeeds.
-    """
+    """Convert media byte progress to on_progress percent (0-99, monotonic)."""
     if on_progress is None:
         return None
 
@@ -52,6 +49,35 @@ def _bind_media_progress(on_progress: ProgressCallback | None):
         await _invoke_progress(on_progress, pct)
 
     return _report
+
+
+class _CombinedByteProgress:
+    """Map two-stream byte progress onto a single 0-99 percent callback."""
+
+    def __init__(self, on_progress: ProgressCallback | None):
+        self._on_progress = on_progress
+        self._lock = asyncio.Lock()
+        self._parts: dict[str, tuple[int, int | None]] = {}
+        self._last_pct = -1
+
+    def bind(self, part_id: str):
+        if self._on_progress is None:
+            return None
+
+        async def _report(downloaded: int, total: int | None) -> None:
+            async with self._lock:
+                self._parts[part_id] = (downloaded, total)
+                totals = [size for _, size in self._parts.values() if size]
+                if len(totals) != len(self._parts) or not totals:
+                    return
+                done = sum(size for size, _ in self._parts.values())
+                pct = min(99, int(done * 100 / sum(totals)))
+                if pct <= self._last_pct:
+                    return
+                self._last_pct = pct
+                await _invoke_progress(self._on_progress, pct)
+
+        return _report
 
 
 class Downloader:
@@ -71,56 +97,80 @@ class Downloader:
         self.context.logger.debug(f"{DOMAIN} downloader initialized")
 
     async def download(self, data: dict[str, Any]) -> dict[str, Any]:
-        if not self._client:
+        client = self._client
+        if not client:
             raise RuntimeError("Downloader not initialized")
         media = data.get("media")
         if not media:
             raise ValueError("Missing 'media' in download data")
 
-        media_url = media.get("url")
-        fallbacks = [u for u in (media.get("url_fallbacks") or [])]
-        media_urls = ([media_url] if media_url else []) + fallbacks
-        if not media_urls:
-            raise ValueError("Missing 'url' and 'url_fallbacks' in media object")
+        streams = [stream for stream in (media.get("streams") or []) if isinstance(stream, dict)]
+        downloads = [(stream.get("role"), _stream_urls(stream)) for stream in streams if stream.get("role") != "link"]
+        downloads = [(role, urls) for role, urls in downloads if role and urls]
+        if not downloads:
+            raise ValueError("Missing downloadable streams in media object")
 
-        cover_urls = [media["cover"]] + [u for u in (media.get("cover_fallbacks") or [])] if media.get("cover") else []
         on_progress: ProgressCallback | None = data.get("on_progress")
+        progress_roles = [role for role, _ in downloads if role != "cover"]
+        combined = _CombinedByteProgress(on_progress) if len(progress_roles) > 1 else None
+        single = _bind_media_progress(on_progress) if combined is None else None
 
         self.context.logger.debug(
-            f"Starting download: {len(media_urls)} media URL(s), "
-            f"primary={media_urls[0]}, cover={media.get('cover') or 'none'}"
+            f"Starting download: roles={[role for role, _ in downloads]}"
         )
 
-        tasks = [
-            self._client.download_file(
-                media_urls,
-                max_retries=self._max_retries,
-                on_byte_progress=_bind_media_progress(on_progress),
-            )
-        ]
-        if cover_urls:
-            tasks.append(
-                self._client.download_file(
-                    cover_urls,
-                    max_retries=self._max_retries,
+        temps: dict[str, Path] = {}
+        try:
+            tasks = []
+            roles: list[str] = []
+            for role, urls in downloads:
+                roles.append(role)
+                if combined is not None and role != "cover":
+                    byte_progress = combined.bind(role)
+                elif role != "cover":
+                    byte_progress = single
+                else:
+                    byte_progress = None
+                tasks.append(
+                    client.download_file(
+                        urls,
+                        max_retries=self._max_retries,
+                        on_byte_progress=byte_progress,
+                    )
                 )
-            )
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for role, result in zip(roles, results, strict=True):
+                if role == "cover":
+                    cover_path = self._optional_cover(result)
+                    if cover_path is not None:
+                        temps[role] = cover_path
+                    continue
+                temps[role] = self._require_path(result, role)
+            await _invoke_progress(on_progress, 100)
+            return {"streams": {role: str(path) for role, path in temps.items()}}
+        except Exception:
+            for path in temps.values():
+                path.unlink(missing_ok=True)
+            raise
 
-        media_result = results[0]
-        if isinstance(media_result, BaseException):
-            raise media_result
-        media_path: Path = media_result
+    def _require_path(self, result: object, label: str) -> Path:
+        if isinstance(result, BaseException):
+            raise result
+        if not isinstance(result, Path):
+            raise RuntimeError(f"Expected {label} download path, got {type(result)!r}")
+        return result
 
-        cover_result = results[1] if cover_urls else None
-        if isinstance(cover_result, BaseException):
-            self.context.logger.warning(f"Cover download failed, skipping: {cover_result}")
-            cover_result = None
-        cover_path: Path | None = cover_result
+    def _optional_cover(self, result: object) -> Path | None:
+        if result is None:
+            return None
+        if isinstance(result, BaseException):
+            self.context.logger.warning(f"Cover download failed, skipping: {result}")
+            return None
+        if not isinstance(result, Path):
+            self.context.logger.warning(f"Cover download returned unexpected result, skipping: {result!r}")
+            return None
+        return result
 
-        await _invoke_progress(on_progress, 100)
 
-        return {
-            "media_path": str(media_path) if media_path else None,
-            "cover_path": str(cover_path) if cover_path else None,
-        }
+def _stream_urls(stream: dict[str, Any]) -> list[str]:
+    return [u for u in (stream.get("urls") or []) if isinstance(u, str) and u]

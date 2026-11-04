@@ -21,6 +21,7 @@ from .const import (
     APPKEY,
     APPSEC,
     DOWNLOAD_HEADERS,
+    DOWNLOAD_TIMEOUT,
     NAV_URL,
     PLAYURL_FNVAL,
     PLAYURL_QN,
@@ -210,7 +211,7 @@ class BilibiliClient:
                     async with session.get(
                         current_url,
                         headers=DOWNLOAD_HEADERS,
-                        timeout=aiohttp.ClientTimeout(total=300),
+                        timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT),
                     ) as response:
                         response.raise_for_status()
                         expected_size = response.content_length

@@ -8,12 +8,16 @@ from urllib.parse import parse_qs, urlparse
 
 from contenthive.plugins.context import PluginContext
 from contenthive.plugins.contracts import (
+    AudioStream,
+    CoverStream,
     MediaType,
     ParserAuthorInfo,
     ParserMediaInfo,
     ParserPlatformInfo,
     ParserResult,
     ParserResultStatus,
+    VideoStream,
+    source_key_from_url,
 )
 
 from .client import BilibiliClient
@@ -27,7 +31,14 @@ from .const import (
     URL_PATTERN,
     VIDEO_URL_PATTERN,
 )
-from .utils import extract_window_json, to_https
+from .utils import (
+    collect_dash_audios,
+    extract_window_json,
+    pick_best_stream,
+    stream_url,
+    stream_urls,
+    to_https,
+)
 
 
 async def async_setup_entry(context: PluginContext, entry, async_add_entities):
@@ -40,6 +51,15 @@ async def async_setup_entry(context: PluginContext, entry, async_add_entities):
         context.register_service(DOMAIN, "parse", parser.parse)
 
     context.logger.info(f"{DOMAIN} parser platform setup completed")
+
+
+def _audio_label(codec: str | None) -> str | None:
+    text = (codec or "").lower()
+    if "flac" in text:
+        return "FLAC"
+    if any(token in text for token in ("ec-3", "eac3", "ac-3", "ac3")):
+        return "杜比"
+    return None
 
 
 class BilibiliParser:
@@ -86,12 +106,8 @@ class BilibiliParser:
                 part_title = (pages[part_id - 1] or {}).get("part") or ""
                 title = f"{title} p{part_id:02d} {part_title}".rstrip()
 
-            play_info = self._playinfo_from_page(html)
-            page_matches_part = not (len(pages) > 1 and part_id not in (None, 1))
-            if not page_matches_part or not self._has_durl(play_info):
-                play_info = await self._client.fetch_playurl(bvid, cid)
-
-            media = self._parse_media(video_data, play_info, title, part_id)
+            play_info = await self._client.fetch_playurl(bvid, cid)
+            media = self._parse_media(video_data, play_info, title, part_id, cid)
             pid = f"{bvid}_p{part_id}" if part_id and len(pages) > 1 else bvid
             post_time = video_data.get("pubdate")
             if post_time is not None:
@@ -208,25 +224,40 @@ class BilibiliParser:
             raise Exception("No cid found for this video")
         return cid
 
-    def _playinfo_from_page(self, html: str) -> dict | None:
-        payload = extract_window_json(html, "__playinfo__")
-        if not payload:
-            return None
-        data = payload.get("data")
-        return data if isinstance(data, dict) else None
-
-    def _has_durl(self, play_info: dict | None) -> bool:
-        if not play_info:
-            return False
-        durl = play_info.get("durl") or []
-        return bool(durl and isinstance(durl, list) and durl[0].get("url"))
-
     def _parse_media(
-        self, video_data: dict, play_info: dict, title: str, part_id: int | None
+        self, video_data: dict, play_info: dict, title: str, part_id: int | None, cid: int | str
     ) -> list[ParserMediaInfo]:
+        cover = to_https(video_data.get("pic"))
+        if not cover:
+            cover = to_https((video_data.get("stat") or {}).get("pic"))
+        cover_stream = CoverStream(urls=[cover]) if cover else None
+
+        dash_media = self._media_from_dash(play_info)
+        if dash_media is not None:
+            video_stream, audio_stream = dash_media
+            duration = self._duration_ms(play_info, None, video_data, part_id)
+            streams = [video_stream, audio_stream]
+            if cover_stream is not None:
+                streams.append(cover_stream)
+            extra: dict = {"cid": cid}
+            if video_stream.quality is not None:
+                extra["qn"] = video_stream.quality
+            return [
+                ParserMediaInfo(
+                    source_key=source_key_from_url(video_stream.urls[0]),
+                    type=MediaType.VIDEO,
+                    title=title or None,
+                    duration=duration,
+                    width=video_stream.width,
+                    height=video_stream.height,
+                    streams=streams,
+                    extra=extra,
+                )
+            ]
+
         durl = play_info.get("durl") or []
         if not durl:
-            raise Exception("No muxed mp4 stream (durl) returned")
+            raise Exception("No DASH or muxed mp4 stream returned")
         if len(durl) > 1:
             self.context.logger.warning(
                 f"{DOMAIN}: playurl returned {len(durl)} durl segments; using the first segment only"
@@ -240,33 +271,96 @@ class BilibiliParser:
         backups = first.get("backup_url") or []
         if isinstance(backups, str):
             backups = [backups]
-        url_fallbacks = [u for u in backups if isinstance(u, str) and u]
-
-        # ParserMediaInfo.duration is milliseconds (iOS and other plugins).
-        # playurl timelength / durl.length are ms; page duration is seconds.
-        duration = play_info.get("timelength")
-        if duration is None:
-            duration = first.get("length")
-        duration = int(duration) if duration is not None else self._duration_ms_from_page(video_data, part_id)
-
-        cover = to_https(video_data.get("pic"))
-        if not cover:
-            cover = to_https((video_data.get("stat") or {}).get("pic"))
-
+        fallbacks = [u for u in backups if isinstance(u, str) and u]
+        duration = self._duration_ms(play_info, first, video_data, part_id)
         width, height = self._media_size(video_data, play_info, part_id)
-
+        video_stream = VideoStream(urls=[media_url, *fallbacks], width=width, height=height)
+        streams = [video_stream]
+        if cover_stream is not None:
+            streams.append(cover_stream)
         return [
             ParserMediaInfo(
-                url=media_url,
-                url_fallbacks=url_fallbacks or None,
+                source_key=source_key_from_url(media_url),
                 type=MediaType.VIDEO,
                 title=title or None,
-                cover=cover,
                 duration=duration,
                 width=width,
                 height=height,
+                streams=streams,
+                extra={"cid": cid},
             )
         ]
+
+    def _media_from_dash(self, play_info: dict) -> tuple[VideoStream, AudioStream] | None:
+        dash = play_info.get("dash")
+        if not isinstance(dash, dict):
+            return None
+        videos = dash.get("video") or []
+        if not isinstance(videos, list):
+            return None
+        video = pick_best_stream(videos)
+        if not video:
+            return None
+        media_url = stream_url(video)
+        if not media_url:
+            return None
+
+        audio = pick_best_stream(collect_dash_audios(dash), prefer_quality_id=False)
+        audio_url = stream_url(audio) if audio else None
+        if not audio or not audio_url:
+            return None
+        return self._video_stream(video), self._audio_stream(audio)
+
+    def _video_stream(self, video: dict) -> VideoStream:
+        width, height = self._stream_size(video)
+        quality = video.get("id")
+        bandwidth = video.get("bandwidth")
+        try:
+            bandwidth_int = int(bandwidth) if bandwidth is not None else None
+        except (TypeError, ValueError):
+            bandwidth_int = None
+        codecs = video.get("codecs")
+        return VideoStream(
+            urls=stream_urls(video),
+            codec=codecs if isinstance(codecs, str) else None,
+            bandwidth=bandwidth_int,
+            width=width,
+            height=height,
+            quality=str(quality) if quality is not None else None,
+        )
+
+    def _audio_stream(self, audio: dict) -> AudioStream:
+        quality = audio.get("id")
+        bandwidth = audio.get("bandwidth")
+        try:
+            bandwidth_int = int(bandwidth) if bandwidth is not None else None
+        except (TypeError, ValueError):
+            bandwidth_int = None
+        codecs = audio.get("codecs")
+        codec = codecs if isinstance(codecs, str) else None
+        return AudioStream(
+            urls=stream_urls(audio),
+            codec=codec,
+            bandwidth=bandwidth_int,
+            quality=str(quality) if quality is not None else None,
+            label=_audio_label(codec),
+        )
+
+    def _stream_size(self, stream: dict) -> tuple[int | None, int | None]:
+        width, height = stream.get("width"), stream.get("height")
+        if not width or not height:
+            return None, None
+        return int(width), int(height)
+
+    def _duration_ms(self, play_info: dict, durl: dict | None, video_data: dict, part_id: int | None) -> int | None:
+        # ParserMediaInfo.duration is milliseconds (iOS and other plugins).
+        # playurl timelength / durl.length are ms; page duration is seconds.
+        duration = play_info.get("timelength")
+        if duration is None and durl is not None:
+            duration = durl.get("length")
+        if duration is not None:
+            return int(duration)
+        return self._duration_ms_from_page(video_data, part_id)
 
     def _duration_ms_from_page(self, video_data: dict, part_id: int | None) -> int | None:
         pages = video_data.get("pages") if isinstance(video_data.get("pages"), list) else []
@@ -281,9 +375,7 @@ class BilibiliParser:
             return None
         return int(raw * 1000)
 
-    def _media_size(
-        self, video_data: dict, play_info: dict, part_id: int | None
-    ) -> tuple[int | None, int | None]:
+    def _media_size(self, video_data: dict, play_info: dict, part_id: int | None) -> tuple[int | None, int | None]:
         quality = play_info.get("quality")
         dash_size = self._dash_size(play_info, quality)
         if dash_size != (None, None):
