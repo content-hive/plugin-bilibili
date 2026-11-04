@@ -1,0 +1,33 @@
+name: Check release
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check tag matches manifest version
+        shell: python
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          import json
+          import os
+          import sys
+
+          with open("plugin/manifest.json", encoding="utf-8") as f:
+              version = json.load(f).get("version")
+
+          tag = os.environ["TAG"]
+          if tag != f"v{version}":
+              print(f"::error::Release tag '{tag}' does not match plugin/manifest.json version '{version}' (expected 'v{version}')")
+              sys.exit(1)

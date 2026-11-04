@@ -1,0 +1,45 @@
+name: Validate manifest
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check manifest
+        shell: python
+        run: |
+          import json
+          import sys
+
+          errors = []
+          with open("plugin/manifest.json", encoding="utf-8") as f:
+              manifest = json.load(f)
+          with open("contenthive.json", encoding="utf-8") as f:
+              repo_meta = json.load(f)
+
+          for field in ("domain", "name", "version"):
+              if not manifest.get(field):
+                  errors.append(f"plugin/manifest.json: missing '{field}'")
+
+          if repo_meta.get("domain") != manifest.get("domain"):
+              errors.append("contenthive.json: domain does not match plugin/manifest.json")
+
+          if not repo_meta.get("name"):
+              errors.append("contenthive.json: missing 'name'")
+
+          for error in errors:
+              print(f"::error::{error}")
+          sys.exit(1 if errors else 0)
