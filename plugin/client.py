@@ -10,16 +10,19 @@ import os
 import tempfile
 import time
 from collections.abc import Callable
+from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
 import aiofiles
 import aiohttp
+from yarl import URL
 
 from .const import (
     APPKEY,
     APPSEC,
+    COOKIE_DOMAIN,
     DOWNLOAD_HEADERS,
     DOWNLOAD_TIMEOUT,
     NAV_URL,
@@ -28,10 +31,11 @@ from .const import (
     PLAYURL_URL,
     REQUEST_HEADERS,
     SPACE_APP_URL,
-    SPACE_CARD_URL,
     VIEW_DETAIL_URL,
 )
 from .wbi import WbiKeyCache, build_dm_params, mixin_key_from_nav, sign_wbi
+
+_COOKIE_ORIGIN = URL("https://www.bilibili.com/")
 
 
 class BilibiliClient:
@@ -57,10 +61,23 @@ class BilibiliClient:
         self._session = aiohttp.ClientSession(
             trust_env=True,
             headers=REQUEST_HEADERS,
-            cookies=self.cookies or None,
+            cookie_jar=self._cookie_jar(self.cookies),
             timeout=aiohttp.ClientTimeout(total=30),
             raise_for_status=False,
         )
+
+    def _cookie_jar(self, cookies: dict[str, str]) -> aiohttp.CookieJar:
+        jar = aiohttp.CookieJar()
+        if not cookies:
+            return jar
+        morsels = SimpleCookie()
+        for name, value in cookies.items():
+            morsels[name] = value
+            morsels[name]["domain"] = COOKIE_DOMAIN
+            morsels[name]["path"] = "/"
+            morsels[name]["secure"] = True
+        jar.update_cookies(morsels, _COOKIE_ORIGIN)
+        return jar
 
     async def close(self) -> None:
         if self._session and not self._session.closed:
@@ -75,9 +92,17 @@ class BilibiliClient:
     def _sync_session_cookies(self) -> None:
         if not self._session or self._session.closed:
             return
-        session_cookies = {morsel.key: morsel.value for morsel in self._session.cookie_jar if morsel.value}
+        session_cookies = {
+            morsel.key: morsel.value
+            for morsel in self._session.cookie_jar
+            if morsel.value and self._is_bilibili_cookie_domain(morsel["domain"])
+        }
         if self.cookies != session_cookies:
             self._notify_cookies_updated(session_cookies)
+
+    def _is_bilibili_cookie_domain(self, domain: str | None) -> bool:
+        host = (domain or "").lstrip(".").lower()
+        return host == COOKIE_DOMAIN or host.endswith(f".{COOKIE_DOMAIN}")
 
     def _notify_cookies_updated(self, updated: dict[str, str]) -> None:
         if self._on_cookies_updated:
@@ -171,15 +196,6 @@ class BilibiliClient:
         data = payload.get("data")
         return data if isinstance(data, dict) else {}
 
-    async def fetch_space_card(self, mid: int | str) -> dict[str, Any]:
-        payload = await self.fetch_json(SPACE_CARD_URL, {"mid": mid, "photo": "true"})
-        code = payload.get("code")
-        if code not in (0, None):
-            message = payload.get("message") or "unknown error"
-            raise Exception(f"space card failed: {code}: {message}")
-        data = payload.get("data")
-        return data if isinstance(data, dict) else {}
-
     async def fetch_view_detail(self, *, bvid: str | None = None, aid: str | None = None) -> dict[str, Any]:
         query: dict[str, Any] = {"platform": "web"}
         if bvid:
@@ -207,6 +223,7 @@ class BilibiliClient:
                 tmp_path = Path(tmp_path_str)
                 os.close(tmp_fd)
                 write_path = tmp_path.with_suffix(".tmp")
+                keep_tmp = False
                 try:
                     async with session.get(
                         current_url,
@@ -227,22 +244,21 @@ class BilibiliClient:
 
                         if expected_size is not None and written != expected_size:
                             last_error = ValueError(f"Size mismatch: expected {expected_size}, got {written}")
-                            write_path.unlink(missing_ok=True)
-                            tmp_path.unlink(missing_ok=True)
                         else:
                             os.replace(str(write_path), str(tmp_path))
+                            keep_tmp = True
                             return tmp_path
                 except aiohttp.ClientResponseError as e:
-                    write_path.unlink(missing_ok=True)
-                    tmp_path.unlink(missing_ok=True)
                     last_error = e
                     if 400 <= e.status < 500 and e.status != 429:
                         self.logger.debug(f"HTTP {e.status} for {current_url}, trying next URL")
                         break
                 except Exception as e:
-                    write_path.unlink(missing_ok=True)
-                    tmp_path.unlink(missing_ok=True)
                     last_error = e
+                finally:
+                    if not keep_tmp:
+                        write_path.unlink(missing_ok=True)
+                        tmp_path.unlink(missing_ok=True)
 
                 if attempt < max_retries:
                     wait = 2**attempt

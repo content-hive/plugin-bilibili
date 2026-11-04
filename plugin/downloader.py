@@ -61,6 +61,7 @@ class _CombinedByteProgress:
         self._last_pct = -1
 
     def bind(self, part_id: str):
+        self._parts[part_id] = (0, None)
         if self._on_progress is None:
             return None
 
@@ -115,9 +116,7 @@ class Downloader:
         combined = _CombinedByteProgress(on_progress) if len(progress_roles) > 1 else None
         single = _bind_media_progress(on_progress) if combined is None else None
 
-        self.context.logger.debug(
-            f"Starting download: roles={[role for role, _ in downloads]}"
-        )
+        self.context.logger.debug(f"Starting download: roles={[role for role, _ in downloads]}")
 
         temps: dict[str, Path] = {}
         try:
@@ -140,15 +139,17 @@ class Downloader:
                 )
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for role, result in zip(roles, results, strict=True):
+                if isinstance(result, Path):
+                    temps[role] = result
+            for role, result in zip(roles, results, strict=True):
                 if role == "cover":
-                    cover_path = self._optional_cover(result)
-                    if cover_path is not None:
-                        temps[role] = cover_path
+                    if role not in temps:
+                        self._optional_cover(result)
                     continue
-                temps[role] = self._require_path(result, role)
+                self._require_path(result, role)
             await _invoke_progress(on_progress, 100)
             return {"streams": {role: str(path) for role, path in temps.items()}}
-        except Exception:
+        except BaseException:
             for path in temps.values():
                 path.unlink(missing_ok=True)
             raise

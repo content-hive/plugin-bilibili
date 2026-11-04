@@ -22,8 +22,8 @@ URL_PATTERN = rf"(?:{VIDEO_URL_PATTERN}|{SHORT_URL_PATTERN})"
 NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
 PLAYURL_URL = "https://api.bilibili.com/x/player/wbi/playurl"
 VIEW_DETAIL_URL = "https://api.bilibili.com/x/web-interface/wbi/view/detail"
-SPACE_CARD_URL = "https://api.bilibili.com/x/web-interface/card"
 SPACE_APP_URL = "https://app.bilibili.com/x/v2/space"
+COOKIE_DOMAIN = "bilibili.com"
 
 # Public Android client key, used to call the mobile space API for garb/iOS banners.
 APPKEY = "1d8b6e7d45233436"

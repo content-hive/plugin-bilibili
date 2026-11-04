@@ -459,21 +459,12 @@ class BilibiliParser:
             return None
         try:
             space = await self._client.fetch_app_space(uid)
-            images = space.get("images") or {}
-            garb = images.get("garb") or {}
-            banner = to_https(garb.get("large_image") or images.get("imgUrl"))
-            if banner:
-                return banner
         except Exception as e:
             self.context.logger.warning(f"Failed to fetch mobile space banner for {uid}: {e}")
-
-        try:
-            card = await self._client.fetch_space_card(uid)
-        except Exception as e:
-            self.context.logger.warning(f"Failed to fetch space card banner for {uid}: {e}")
             return None
-        web = card.get("space") or {}
-        return to_https(web.get("l_img") or web.get("s_img"))
+        images = space.get("images") or {}
+        garb = images.get("garb") or {}
+        return to_https(garb.get("large_image") or images.get("imgUrl"))
 
     def _parse_platform(self) -> ParserPlatformInfo:
         return ParserPlatformInfo(
