@@ -22,17 +22,25 @@ from yarl import URL
 from .const import (
     APPKEY,
     APPSEC,
+    BANGUMI_PLAYURL_FNVAL,
     COOKIE_DOMAIN,
     DOWNLOAD_HEADERS,
     DOWNLOAD_TIMEOUT,
+    DYNAMIC_DETAIL_URL,
     NAV_URL,
+    OPUS_DETAIL_URL,
+    PGC_PLAYURL_URL,
+    PGC_SEASON_URL,
     PLAYURL_FNVAL,
     PLAYURL_QN,
     PLAYURL_URL,
+    PUGV_PLAYURL_URL,
+    PUGV_SEASON_URL,
     REQUEST_HEADERS,
     SPACE_APP_URL,
     VIEW_DETAIL_URL,
 )
+from .utils import unwrap_bangumi_play
 from .wbi import WbiKeyCache, build_dm_params, mixin_key_from_nav, sign_wbi
 
 _COOKIE_ORIGIN = URL("https://www.bilibili.com/")
@@ -124,15 +132,35 @@ class BilibiliClient:
                 raise Exception(f"HTTP {resp.status} fetching {url!r}; body preview: {preview!r}")
             return str(resp.url), text
 
-    async def fetch_json(self, url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def fetch_json(
+        self,
+        url: str,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         session = self._require_session()
         request_url = f"{url}?{urlencode(params)}" if params else url
-        async with session.get(request_url) as resp:
+        async with session.get(request_url, headers=headers) as resp:
             data = await resp.json(content_type=None)
             self._sync_session_cookies()
             if resp.status != 200:
                 raise Exception(f"HTTP {resp.status} fetching {url}")
             return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _check_code(payload: dict[str, Any], label: str) -> None:
+        code = payload.get("code")
+        if code not in (0, None):
+            message = payload.get("message") or "unknown error"
+            raise Exception(f"{label} failed: {code}: {message}")
+
+    @classmethod
+    def _unwrap(cls, payload: dict[str, Any], label: str, key: str = "data") -> dict[str, Any]:
+        cls._check_code(payload, label)
+        value = payload.get(key)
+        if not isinstance(value, dict):
+            raise Exception(f"{label} returned no {key}")
+        return value
 
     async def _mixin_key(self) -> str:
         cached = self._wbi_cache.get()
@@ -161,14 +189,7 @@ class BilibiliClient:
         if not self.is_logged_in:
             params["try_look"] = 1
         payload = await self.signed_get(PLAYURL_URL, params)
-        code = payload.get("code")
-        if code not in (0, None):
-            message = payload.get("message") or "unknown error"
-            raise Exception(f"playurl failed: {code}: {message}")
-        data = payload.get("data")
-        if not isinstance(data, dict):
-            raise Exception("playurl returned no data")
-        return data
+        return self._unwrap(payload, "playurl")
 
     def _sign_app(self, params: dict[str, Any]) -> dict[str, str]:
         signed = {k: str(v) for k, v in params.items()}
@@ -189,12 +210,57 @@ class BilibiliClient:
             }
         )
         payload = await self.fetch_json(SPACE_APP_URL, params)
-        code = payload.get("code")
-        if code not in (0, None):
-            message = payload.get("message") or "unknown error"
-            raise Exception(f"app space failed: {code}: {message}")
+        self._check_code(payload, "app space")
         data = payload.get("data")
         return data if isinstance(data, dict) else {}
+
+    async def fetch_bangumi_season(self, ep_id: str) -> dict[str, Any]:
+        payload = await self.fetch_json(PGC_SEASON_URL, {"ep_id": ep_id})
+        return self._unwrap(payload, "bangumi season", key="result")
+
+    async def fetch_bangumi_playurl(
+        self, ep_id: str, referer: str | None = None
+    ) -> tuple[dict[str, Any], int | None, dict[str, Any]]:
+        """Return `(video_info, status_code, play_meta)` for one bangumi episode."""
+        headers = {"Referer": referer} if referer else None
+        payload = await self.fetch_json(
+            PGC_PLAYURL_URL,
+            {"fnval": BANGUMI_PLAYURL_FNVAL, "ep_id": ep_id},
+            headers=headers,
+        )
+        return unwrap_bangumi_play(payload)
+
+    async def fetch_cheese_season(self, ep_id: str) -> dict[str, Any]:
+        payload = await self.fetch_json(PUGV_SEASON_URL, {"ep_id": ep_id})
+        return self._unwrap(payload, "course season")
+
+    async def fetch_cheese_playurl(self, aid: int | str, cid: int | str, ep_id: str) -> dict[str, Any]:
+        payload = await self.fetch_json(
+            PUGV_PLAYURL_URL,
+            {
+                "avid": aid,
+                "cid": cid,
+                "ep_id": ep_id,
+                "fnval": PLAYURL_FNVAL,
+                "fourk": 1,
+            },
+        )
+        return self._unwrap(payload, "course playurl")
+
+    async def fetch_opus(self, opus_id: str) -> dict[str, Any]:
+        """Return the opus item, or `{}` when the ID is a plain dynamic without opus content."""
+        payload = await self.fetch_json(OPUS_DETAIL_URL, {"id": opus_id})
+        self._check_code(payload, "opus detail")
+        item = (payload.get("data") or {}).get("item")
+        return item if isinstance(item, dict) else {}
+
+    async def fetch_dynamic(self, dynamic_id: str) -> dict[str, Any]:
+        payload = await self.fetch_json(DYNAMIC_DETAIL_URL, {"id": dynamic_id})
+        self._check_code(payload, "dynamic detail")
+        item = (payload.get("data") or {}).get("item")
+        if not isinstance(item, dict) or not item.get("id_str"):
+            raise Exception("dynamic detail returned no item")
+        return item
 
     async def fetch_view_detail(self, *, bvid: str | None = None, aid: str | None = None) -> dict[str, Any]:
         query: dict[str, Any] = {"platform": "web"}
