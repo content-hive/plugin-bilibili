@@ -2,43 +2,37 @@
 
 from __future__ import annotations
 
-import re
-from typing import NoReturn
-from urllib.parse import parse_qs, urlparse
+import asyncio
+from urllib.parse import urlparse
 
 from contenthive.plugins.context import PluginContext
 from contenthive.plugins.contracts import (
-    AudioStream,
     CoverStream,
+    LinkStream,
     MediaType,
     ParserAuthorInfo,
     ParserMediaInfo,
     ParserPlatformInfo,
     ParserResult,
     ParserResultStatus,
-    VideoStream,
     source_key_from_url,
 )
 
+from . import opus, pgc, video
 from .client import BilibiliClient
 from .const import (
+    BANGUMI_EP_URL_RE,
+    CHEESE_EP_URL_RE,
     DOMAIN,
+    OPUS_URL_RE,
     PLATFORM_CODE,
     PLATFORM_ICON,
     PLATFORM_NAME,
     PLATFORM_URL,
-    QUALITY_PIXELS,
-    URL_PATTERN,
-    VIDEO_URL_PATTERN,
+    URL_PATTERNS,
+    VIDEO_URL_RE,
 )
-from .utils import (
-    collect_dash_audios,
-    extract_window_json,
-    pick_best_stream,
-    stream_url,
-    stream_urls,
-    to_https,
-)
+from .utils import as_text, clean_title, extract_window_json, join_parts, to_https, to_int
 
 
 async def async_setup_entry(context: PluginContext, entry, async_add_entities):
@@ -53,17 +47,26 @@ async def async_setup_entry(context: PluginContext, entry, async_add_entities):
     context.logger.info(f"{DOMAIN} parser platform setup completed")
 
 
-def _audio_label(codec: str | None) -> str | None:
-    text = (codec or "").lower()
-    if "flac" in text:
-        return "FLAC"
-    if any(token in text for token in ("ec-3", "eac3", "ac-3", "ac3")):
-        return "杜比"
-    return None
+def _mark_seen(url: str, seen: set[str]) -> None:
+    """Record `url` and fail when an opus link chain revisits it."""
+    parsed = urlparse(url)
+    key = f"{parsed.netloc}{parsed.path}".rstrip("/")
+    if key in seen:
+        raise Exception(f"Link loop detected at {url}")
+    seen.add(key)
+
+
+def _unsupported_url_message(url: str) -> str:
+    path = urlparse(url).path or ""
+    if "/bangumi/" in path or "/cheese/" in path:
+        return pgc.SEASON_UNSUPPORTED
+    if path.startswith("/live") or "live.bilibili.com" in url:
+        return "Live streams are not supported"
+    return f"Unsupported Bilibili URL: {url}"
 
 
 class BilibiliParser:
-    """Parser for Bilibili BV/av videos, the current part, and b23.tv short links."""
+    """Parser for BV/av videos, bangumi and course episodes, opus posts, and b23.tv short links."""
 
     def __init__(self, context: PluginContext, entry):
         self.context = context
@@ -75,7 +78,7 @@ class BilibiliParser:
         url = data.get("url")
         if not url:
             return False
-        return bool(re.match(URL_PATTERN, url))
+        return any(pattern.match(url) for pattern in URL_PATTERNS)
 
     async def parse(self, data: dict) -> ParserResult:
         url = data.get("url")
@@ -83,351 +86,263 @@ class BilibiliParser:
             raise ValueError("No URL provided for parsing")
 
         try:
-            resolved, html = await self._client.fetch_text(url)
-            if not re.match(VIDEO_URL_PATTERN, resolved):
-                raise Exception(self._unsupported_url_message(resolved))
-
-            initial_state = extract_window_json(html, "__INITIAL_STATE__")
-            if not initial_state:
-                await self._raise_missing_state(resolved, html)
-
-            video_data, is_festival = self._video_data(initial_state)
-            bvid = video_data.get("bvid")
-            if not bvid:
-                raise Exception("No bvid found in page state")
-            if is_festival and not video_data.get("pic"):
-                video_data = self._festival_video_data(initial_state, video_data, bvid)
-
-            pages = video_data.get("pages") if isinstance(video_data.get("pages"), list) else []
-            part_id = self._part_id(url, resolved, pages)
-            cid = self._cid_for_part(video_data, pages, part_id)
-            title = video_data.get("title") or ""
-            if part_id and len(pages) > 1:
-                part_title = (pages[part_id - 1] or {}).get("part") or ""
-                title = f"{title} p{part_id:02d} {part_title}".rstrip()
-
-            play_info = await self._client.fetch_playurl(bvid, cid)
-            media = self._parse_media(video_data, play_info, title, part_id, cid)
-            pid = f"{bvid}_p{part_id}" if part_id and len(pages) > 1 else bvid
-            post_time = video_data.get("pubdate")
-            if post_time is not None:
-                post_time = int(post_time)
-
-            return ParserResult(
-                pid=pid,
-                url=url,
-                title=title or None,
-                content=video_data.get("desc") or None,
-                media=media,
-                author=await self._parse_author(initial_state, video_data, is_festival),
-                platform=self._parse_platform(),
-                post_time=post_time,
-                parser=DOMAIN,
-                state=ParserResultStatus.SUCCESS,
-            )
+            return await self._dispatch(url, seen=set())
         except Exception as e:
             self.context.logger.exception(f"Failed to parse {url}")
             raise Exception(f"Failed to parse Bilibili URL: {e}") from e
 
-    async def _raise_missing_state(self, url: str, html: str) -> NoReturn:
+    async def _dispatch(self, url: str, seen: set[str]) -> ParserResult:
+        # Opus and course episodes only need the ID, so skip the page fetch for direct links.
+        opus_match = OPUS_URL_RE.match(url)
+        if opus_match:
+            _mark_seen(url, seen)
+            return await self._parse_opus(url, opus_match.group("opus_id"), seen)
+        cheese_match = CHEESE_EP_URL_RE.match(url)
+        if cheese_match:
+            _mark_seen(url, seen)
+            return await self._parse_cheese_episode(url, cheese_match.group("id"))
+
+        resolved, html = await self._client.fetch_text(url)
+        return await self._parse_resolved(url, resolved, html, seen)
+
+    async def _parse_resolved(self, url: str, resolved: str, html: str, seen: set[str]) -> ParserResult:
+        _mark_seen(resolved, seen)
+        bangumi_match = BANGUMI_EP_URL_RE.match(resolved)
+        if bangumi_match:
+            return await self._parse_bangumi_episode(url, bangumi_match.group("id"), html)
+        cheese_match = CHEESE_EP_URL_RE.match(resolved)
+        if cheese_match:
+            return await self._parse_cheese_episode(url, cheese_match.group("id"))
+        opus_match = OPUS_URL_RE.match(resolved)
+        if opus_match:
+            return await self._parse_opus(url, opus_match.group("opus_id"), seen)
+        if not VIDEO_URL_RE.match(resolved):
+            raise Exception(_unsupported_url_message(resolved))
+        return await self._parse_video(url, resolved, html)
+
+    async def _parse_opus(self, url: str, opus_id: str, seen: set[str]) -> ParserResult:
+        item = await self._client.fetch_opus(opus_id)
+        if not opus.has_content(item):
+            return await self._parse_dynamic_link(url, opus_id)
+
+        paragraphs = opus.paragraphs(item)
+        media = opus.media(paragraphs)
+        if not media:
+            if opus.is_only_fans(item):
+                raise Exception("Login or purchase required to view this opus")
+            jump = opus.first_playable_url(paragraphs)
+            if not jump:
+                raise Exception("This opus has no images or playable video")
+            return await self._dispatch(jump, seen)
+
+        author_info = opus.author(item)
+        return ParserResult(
+            pid=f"opus_{opus_id}",
+            url=url,
+            title=opus.title(item),
+            content=opus.content(paragraphs),
+            media=media,
+            author=await self._author_from_up(author_info),
+            platform=self._parse_platform(),
+            post_time=opus.pub_ts(author_info),
+            parser=DOMAIN,
+            state=ParserResultStatus.SUCCESS,
+        )
+
+    async def _parse_dynamic_link(self, url: str, dynamic_id: str) -> ParserResult:
+        item = await self._client.fetch_dynamic(dynamic_id)
+        card = opus.dynamic_card(opus.dynamic_subject(item))
+        jump = opus.card_jump_url(card) if card else None
+        if not card or not jump:
+            raise Exception("This dynamic has no linked content")
+
+        cover = to_https(as_text(card.get("cover")))
+        streams: list = [LinkStream(urls=[jump])]
+        if cover:
+            streams.append(CoverStream(urls=[cover]))
+        link_title = clean_title(card.get("title"))
+        author_info = opus.dynamic_author(item)
+        is_forward = item.get("type") == "DYNAMIC_TYPE_FORWARD"
+        return ParserResult(
+            pid=f"opus_{dynamic_id}",
+            url=url,
+            title=None if is_forward else link_title,
+            content=opus.dynamic_text(item),
+            media=[
+                ParserMediaInfo(
+                    source_key=source_key_from_url(jump),
+                    type=MediaType.LINK,
+                    title=link_title,
+                    streams=streams,
+                )
+            ],
+            author=await self._author_from_up(author_info),
+            platform=self._parse_platform(),
+            post_time=opus.pub_ts(author_info),
+            parser=DOMAIN,
+            state=ParserResultStatus.SUCCESS,
+        )
+
+    async def _parse_video(self, url: str, resolved: str, html: str) -> ParserResult:
+        initial_state = extract_window_json(html, "__INITIAL_STATE__")
+        if not initial_state:
+            return await self._parse_missing_video_state(url, resolved, html)
+
+        video_data, is_festival = video.video_data(initial_state)
+        bvid = video_data.get("bvid")
+        if not bvid:
+            raise Exception("No bvid found in page state")
+        if is_festival and not video_data.get("pic"):
+            video_data = video.festival_video_data(initial_state, video_data, bvid)
+
+        page_count = len(video.pages(video_data))
+        part_id = video.part_id(url, resolved, page_count)
+        cid = video.cid_for_part(video_data, part_id)
+        title = video_data.get("title") or ""
+        if part_id:
+            part_title = video.page(video_data, part_id).get("part") or ""
+            title = f"{title} p{part_id:02d} {part_title}".rstrip()
+
+        play_info, author = await asyncio.gather(
+            self._client.fetch_playurl(bvid, cid),
+            self._parse_author(initial_state, video_data, is_festival),
+        )
+        return ParserResult(
+            pid=f"{bvid}_p{part_id}" if part_id else bvid,
+            url=url,
+            title=title or None,
+            content=video_data.get("desc") or None,
+            media=video.build_media(video_data, play_info, title, part_id, cid, self.context.logger),
+            author=author,
+            platform=self._parse_platform(),
+            post_time=to_int(video_data.get("pubdate")),
+            parser=DOMAIN,
+            state=ParserResultStatus.SUCCESS,
+        )
+
+    async def _parse_missing_video_state(self, url: str, resolved: str, html: str) -> ParserResult:
         risk = extract_window_json(html, "_riskdata_") or {}
         if risk.get("v_voucher"):
             raise Exception("Rate limited by Bilibili; try again later")
 
-        error = self._state_error_message(url)
-        match = re.match(VIDEO_URL_PATTERN, url)
+        error = "Unable to extract page state"
+        match = VIDEO_URL_RE.match(resolved)
         if not match:
             raise Exception(error)
-
         prefix = (match.group("prefix") or match.group("festival_prefix") or "").upper()
         video_id = match.group("id") or match.group("festival_id")
+        if not video_id or prefix not in ("BV", "AV"):
+            raise Exception(error)
+
+        query = {"bvid": f"BV{video_id}"} if prefix == "BV" else {"aid": video_id}
         try:
-            if prefix == "BV" and video_id:
-                detail = await self._client.fetch_view_detail(bvid=f"BV{video_id}")
-            elif prefix == "AV" and video_id:
-                detail = await self._client.fetch_view_detail(aid=video_id)
-            else:
-                raise Exception(error)
+            detail = await self._client.fetch_view_detail(**query)
         except Exception as e:
             raise Exception(error) from e
 
         redirect = ((detail.get("data") or {}).get("View") or {}).get("redirect_url") or ""
-        if "/bangumi/" in redirect:
-            raise Exception("Bangumi / season links are not supported")
+        bangumi_id = pgc.path_episode_id(redirect, "bangumi")
+        if bangumi_id:
+            return await self._parse_bangumi_episode(url, bangumi_id, None)
+        cheese_id = pgc.path_episode_id(redirect, "cheese")
+        if cheese_id:
+            return await self._parse_cheese_episode(url, cheese_id)
+        if "/bangumi/" in redirect or "/cheese/" in redirect:
+            raise Exception(pgc.SEASON_UNSUPPORTED)
         raise Exception(error)
 
-    def _state_error_message(self, url: str) -> str:
-        if "/bangumi/" in url:
-            return "Bangumi / season links are not supported"
-        return "Unable to extract page state"
+    async def _parse_bangumi_episode(self, url: str, ep_id: str, html: str | None) -> ParserResult:
+        page_error = pgc.bangumi_page_error(html)
+        if page_error:
+            raise Exception(page_error)
 
-    def _unsupported_url_message(self, url: str) -> str:
-        path = urlparse(url).path or ""
-        if "/bangumi/" in path or "/cheese/" in path:
-            return "Bangumi / season / course links are not supported"
-        if path.startswith("/live") or "live.bilibili.com" in url:
-            return "Live streams are not supported"
-        return f"Unsupported Bilibili URL: {url}"
+        video_info, status_code, play_meta = pgc.bangumi_play_from_html(html)
+        if video_info is None:
+            referer = f"https://www.bilibili.com/bangumi/play/ep{ep_id}"
+            season, (video_info, status_code, play_meta) = await asyncio.gather(
+                self._client.fetch_bangumi_season(ep_id),
+                self._client.fetch_bangumi_playurl(ep_id, referer=referer),
+            )
+        else:
+            season = await self._client.fetch_bangumi_season(ep_id)
 
-    def _video_data(self, state: dict) -> tuple[dict, bool]:
-        error = state.get("error") or {}
-        true_code = error.get("trueCode")
-        if true_code == -403:
-            raise Exception("Login required to view this video")
-        if true_code == -404:
-            raise Exception("This video may be deleted or geo-restricted")
-
-        if "videoData" in state:
-            data = state.get("videoData") or {}
-            if not isinstance(data, dict) or not data:
-                raise Exception("No video data found in page state")
-            return data, False
-
-        data = state.get("videoInfo") or {}
-        if not isinstance(data, dict) or not data:
-            raise Exception("No video data found in page state")
-        return data, True
-
-    def _festival_video_data(self, state: dict, video_data: dict, bvid: str) -> dict:
-        """Copy festival cover onto video_data when pic is missing."""
-        for episode in state.get("sectionEpisodes") or []:
-            if isinstance(episode, dict) and episode.get("bvid") == bvid and episode.get("cover"):
-                return {**video_data, "pic": episode.get("cover")}
-        return video_data
-
-    def _part_id(self, original_url: str, resolved_url: str, pages: list) -> int | None:
-        part = self._query_part(original_url) or self._query_part(resolved_url)
-        if len(pages) <= 1:
-            return None
-        part = part or 1
-        if part < 1 or part > len(pages):
-            raise Exception(f"Part {part} is out of range (1-{len(pages)})")
-        return part
-
-    def _query_part(self, url: str) -> int | None:
-        raw = (parse_qs(urlparse(url).query).get("p") or [None])[-1]
-        if raw is None:
-            return None
-        try:
-            value = int(raw)
-        except (TypeError, ValueError):
-            return None
-        return value if value > 0 else None
-
-    def _cid_for_part(self, video_data: dict, pages: list, part_id: int | None) -> int | str:
-        if part_id and pages:
-            cid = (pages[part_id - 1] or {}).get("cid")
-            if cid:
-                return cid
-        cid = video_data.get("cid")
+        episode = pgc.bangumi_episode(season, ep_id)
+        cid = episode.get("cid")
         if not cid:
-            raise Exception("No cid found for this video")
-        return cid
+            raise Exception("No cid found for this bangumi episode")
+        access_error = pgc.bangumi_access_error(video_info, status_code, play_meta, html)
+        if access_error:
+            raise Exception(access_error)
 
-    def _parse_media(
-        self, video_data: dict, play_info: dict, title: str, part_id: int | None, cid: int | str
-    ) -> list[ParserMediaInfo]:
-        cover = to_https(video_data.get("pic"))
-        if not cover:
-            cover = to_https((video_data.get("stat") or {}).get("pic"))
-        cover_stream = CoverStream(urls=[cover]) if cover else None
-
-        dash_media = self._media_from_dash(play_info)
-        if dash_media is not None:
-            video_stream, audio_stream = dash_media
-            duration = self._duration_ms(play_info, None, video_data, part_id)
-            streams = [video_stream, audio_stream]
-            if cover_stream is not None:
-                streams.append(cover_stream)
-            extra: dict = {"cid": cid}
-            if video_stream.quality is not None:
-                extra["qn"] = video_stream.quality
-            return [
-                ParserMediaInfo(
-                    source_key=source_key_from_url(video_stream.urls[0]),
-                    type=MediaType.VIDEO,
-                    title=title or None,
-                    duration=duration,
-                    width=video_stream.width,
-                    height=video_stream.height,
-                    streams=streams,
-                    extra=extra,
-                )
-            ]
-
-        durl = play_info.get("durl") or []
-        if not durl:
-            raise Exception("No DASH or muxed mp4 stream returned")
-        if len(durl) > 1:
-            self.context.logger.warning(
-                f"{DOMAIN}: playurl returned {len(durl)} durl segments; using the first segment only"
-            )
-
-        first = durl[0]
-        media_url = first.get("url")
-        if not media_url:
-            raise Exception("No muxed mp4 stream (durl) returned")
-
-        backups = first.get("backup_url") or []
-        if isinstance(backups, str):
-            backups = [backups]
-        fallbacks = [u for u in backups if isinstance(u, str) and u]
-        duration = self._duration_ms(play_info, first, video_data, part_id)
-        width, height = self._media_size(video_data, play_info, part_id)
-        video_stream = VideoStream(urls=[media_url, *fallbacks], width=width, height=height)
-        streams = [video_stream]
-        if cover_stream is not None:
-            streams.append(cover_stream)
-        return [
-            ParserMediaInfo(
-                source_key=source_key_from_url(media_url),
-                type=MediaType.VIDEO,
-                title=title or None,
-                duration=duration,
-                width=width,
-                height=height,
-                streams=streams,
-                extra={"cid": cid},
-            )
-        ]
-
-    def _media_from_dash(self, play_info: dict) -> tuple[VideoStream, AudioStream] | None:
-        dash = play_info.get("dash")
-        if not isinstance(dash, dict):
-            return None
-        videos = dash.get("video") or []
-        if not isinstance(videos, list):
-            return None
-        video = pick_best_stream(videos)
-        if not video:
-            return None
-        media_url = stream_url(video)
-        if not media_url:
-            return None
-
-        audio = pick_best_stream(collect_dash_audios(dash), prefer_quality_id=False)
-        audio_url = stream_url(audio) if audio else None
-        if not audio or not audio_url:
-            return None
-        return self._video_stream(video), self._audio_stream(audio)
-
-    def _video_stream(self, video: dict) -> VideoStream:
-        width, height = self._stream_size(video)
-        quality = video.get("id")
-        bandwidth = video.get("bandwidth")
-        try:
-            bandwidth_int = int(bandwidth) if bandwidth is not None else None
-        except (TypeError, ValueError):
-            bandwidth_int = None
-        codecs = video.get("codecs")
-        return VideoStream(
-            urls=stream_urls(video),
-            codec=codecs if isinstance(codecs, str) else None,
-            bandwidth=bandwidth_int,
-            width=width,
-            height=height,
-            quality=str(quality) if quality is not None else None,
+        title = join_parts(episode.get("title"), episode.get("long_title"))
+        cover = episode.get("cover") or season.get("square_cover")
+        return ParserResult(
+            pid=f"bangumi_ep{ep_id}",
+            url=url,
+            title=title or None,
+            content=as_text(season.get("evaluate")),
+            media=video.build_media({"pic": cover, "cid": cid}, video_info, title, None, cid, self.context.logger),
+            author=await self._author_from_up(season.get("up_info"), series_name=pgc.series_title(season)),
+            platform=self._parse_platform(),
+            post_time=to_int(episode.get("pub_time")),
+            parser=DOMAIN,
+            state=ParserResultStatus.SUCCESS,
         )
 
-    def _audio_stream(self, audio: dict) -> AudioStream:
-        quality = audio.get("id")
-        bandwidth = audio.get("bandwidth")
-        try:
-            bandwidth_int = int(bandwidth) if bandwidth is not None else None
-        except (TypeError, ValueError):
-            bandwidth_int = None
-        codecs = audio.get("codecs")
-        codec = codecs if isinstance(codecs, str) else None
-        return AudioStream(
-            urls=stream_urls(audio),
-            codec=codec,
-            bandwidth=bandwidth_int,
-            quality=str(quality) if quality is not None else None,
-            label=_audio_label(codec),
+    async def _parse_cheese_episode(self, url: str, ep_id: str) -> ParserResult:
+        season = await self._client.fetch_cheese_season(ep_id)
+        episode = pgc.cheese_episode(season, ep_id)
+        if episode.get("ep_status") == -1:
+            raise Exception("This course episode is not yet available")
+        if not episode.get("playable"):
+            raise Exception("Login or purchase required to view this course episode")
+
+        aid = episode.get("aid")
+        cid = episode.get("cid")
+        if not aid or not cid:
+            raise Exception("No aid/cid found for this course episode")
+
+        title = pgc.cheese_title(episode)
+        play_info, author = await asyncio.gather(
+            self._client.fetch_cheese_playurl(aid, cid, ep_id),
+            self._author_from_up(season.get("up_info")),
+        )
+        video_data = {
+            "pic": episode.get("cover"),
+            "cid": cid,
+            "duration": episode.get("duration"),
+        }
+        return ParserResult(
+            pid=f"cheese_ep{ep_id}",
+            url=url,
+            title=title or None,
+            content=pgc.season_blurb(season),
+            media=video.build_media(video_data, play_info, title, None, cid, self.context.logger),
+            author=author,
+            platform=self._parse_platform(),
+            post_time=to_int(episode.get("release_date")),
+            parser=DOMAIN,
+            state=ParserResultStatus.SUCCESS,
         )
 
-    def _stream_size(self, stream: dict) -> tuple[int | None, int | None]:
-        width, height = stream.get("width"), stream.get("height")
-        if not width or not height:
-            return None, None
-        return int(width), int(height)
-
-    def _duration_ms(self, play_info: dict, durl: dict | None, video_data: dict, part_id: int | None) -> int | None:
-        # ParserMediaInfo.duration is milliseconds (iOS and other plugins).
-        # playurl timelength / durl.length are ms; page duration is seconds.
-        duration = play_info.get("timelength")
-        if duration is None and durl is not None:
-            duration = durl.get("length")
-        if duration is not None:
-            return int(duration)
-        return self._duration_ms_from_page(video_data, part_id)
-
-    def _duration_ms_from_page(self, video_data: dict, part_id: int | None) -> int | None:
-        pages = video_data.get("pages") if isinstance(video_data.get("pages"), list) else []
-        raw = None
-        if part_id and pages and 0 < part_id <= len(pages):
-            page = pages[part_id - 1] or {}
-            if isinstance(page, dict):
-                raw = page.get("duration")
-        if raw is None:
-            raw = video_data.get("duration")
-        if raw is None:
-            return None
-        return int(raw * 1000)
-
-    def _media_size(self, video_data: dict, play_info: dict, part_id: int | None) -> tuple[int | None, int | None]:
-        quality = play_info.get("quality")
-        dash_size = self._dash_size(play_info, quality)
-        if dash_size != (None, None):
-            return dash_size
-        return self._size_for_quality(self._source_dimension(video_data, part_id), quality)
-
-    def _dash_size(self, play_info: dict, quality: int | None) -> tuple[int | None, int | None]:
-        videos = ((play_info.get("dash") or {}).get("video")) or []
-        if not isinstance(videos, list):
-            return None, None
-        match = next((item for item in videos if isinstance(item, dict) and item.get("id") == quality), None)
-        if not match:
-            return None, None
-        width, height = match.get("width"), match.get("height")
-        if not width or not height:
-            return None, None
-        return int(width), int(height)
-
-    def _source_dimension(self, video_data: dict, part_id: int | None) -> dict:
-        pages = video_data.get("pages") if isinstance(video_data.get("pages"), list) else []
-        if part_id and pages:
-            page = pages[part_id - 1] if 0 < part_id <= len(pages) else {}
-            if isinstance(page, dict) and isinstance(page.get("dimension"), dict):
-                return page["dimension"]
-        dimension = video_data.get("dimension")
-        return dimension if isinstance(dimension, dict) else {}
-
-    def _size_for_quality(self, dimension: dict, quality: int | None) -> tuple[int | None, int | None]:
-        try:
-            src_w = int(dimension.get("width") or 0)
-            src_h = int(dimension.get("height") or 0)
-        except (TypeError, ValueError):
-            return None, None
-        if src_w <= 0 or src_h <= 0:
-            return None, None
-        try:
-            rotate = int(dimension.get("rotate") or 0)
-        except (TypeError, ValueError):
-            rotate = 0
-        if rotate in (90, 270):
-            src_w, src_h = src_h, src_w
-
-        pixels = QUALITY_PIXELS.get(int(quality)) if quality is not None else None
-        if not pixels:
-            return src_w, src_h
-        if src_w >= src_h:
-            height = min(pixels, src_h)
-            width = 2 * (int(height * src_w / src_h) // 2)
-            return width, height
-        width = min(pixels, src_w)
-        height = 2 * (int(width * src_h / src_w) // 2)
-        return width, height
+    async def _author_from_up(self, up_info: object, series_name: str | None = None) -> ParserAuthorInfo:
+        up = up_info if isinstance(up_info, dict) else {}
+        mid = up.get("mid")
+        if mid is None:
+            return ParserAuthorInfo(uid="", name=series_name or None, username="")
+        uid = str(mid)
+        avatar = up.get("avatar")
+        if not isinstance(avatar, str):
+            avatar = up.get("face")
+        return ParserAuthorInfo(
+            uid=uid,
+            name=as_text(up.get("uname") or up.get("name")),
+            username=uid,
+            avatar=to_https(avatar if isinstance(avatar, str) else None),
+            url=f"https://space.bilibili.com/{uid}",
+            banner=await self._author_banner(uid),
+            description=as_text(up.get("sign")),
+        )
 
     async def _parse_author(self, state: dict, video_data: dict, is_festival: bool) -> ParserAuthorInfo:
         if is_festival:
