@@ -131,9 +131,8 @@ class BilibiliParser:
             if opus.is_only_fans(item):
                 raise Exception("Login or purchase required to view this opus")
             jump = opus.first_playable_url(paragraphs)
-            if not jump:
-                raise Exception("This opus has no images or playable video")
-            return await self._dispatch(jump, seen)
+            if jump:
+                return await self._dispatch(jump, seen)
 
         author_info = opus.author(item)
         return ParserResult(

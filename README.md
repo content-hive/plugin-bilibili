@@ -21,8 +21,8 @@ contenthive.json     # repository metadata for the Content Hive plugin catalog
 - Multi-part videos with `?p=` (current part only)
 - `https://www.bilibili.com/bangumi/play/ep{id}` and the `m.bilibili.com` equivalent (one episode)
 - `https://www.bilibili.com/cheese/play/ep{id}` and the `m.bilibili.com` equivalent (one course episode)
-- `https://www.bilibili.com/opus/{id}` image posts
-- `https://t.bilibili.com/{id}` image posts, or a link card when the dynamic forwards another video or episode
+- `https://www.bilibili.com/opus/{id}` image posts and text-only posts
+- `https://t.bilibili.com/{id}` image or text posts, or a link card when the dynamic forwards another video or episode
 - `https://b23.tv/...` short links, including ones that land on an episode or opus page
 
 Bangumi seasons (`/bangumi/play/ss`, `/bangumi/media/md`), course seasons (`/cheese/play/ss`), user spaces, favorites, live streams, and interactive branches are not supported. Use a single episode link instead.
