@@ -167,9 +167,11 @@ def dynamic_text(item: dict) -> str | None:
     for node in desc.get("rich_text_nodes") or []:
         if not isinstance(node, dict):
             continue
-        piece = as_text(node.get("text") or node.get("orig_text"))
-        if piece:
-            parts.append(piece)
+        raw = node.get("text")
+        if not isinstance(raw, str) or raw == "":
+            raw = node.get("orig_text")
+        if isinstance(raw, str):
+            parts.append(raw)
     return "".join(parts).strip() or None
 
 
@@ -177,12 +179,16 @@ def _node_text(node: dict) -> str:
     if node.get("type") == "TEXT_NODE_TYPE_RICH":
         rich = node.get("rich")
         if isinstance(rich, dict):
-            return as_text(rich.get("orig_text")) or ""
+            return _raw_text(rich.get("orig_text"))
         return ""
     word = node.get("word")
     if isinstance(word, dict):
-        return as_text(word.get("words")) or ""
+        return _raw_text(word.get("words"))
     return ""
+
+
+def _raw_text(value: object) -> str:
+    return value if isinstance(value, str) else ""
 
 
 def _picture(item: object) -> ParserMediaInfo | None:
